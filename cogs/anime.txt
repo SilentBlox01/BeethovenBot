@@ -1,0 +1,166 @@
+# cogs/anime.py
+import discord
+from discord import app_commands
+from discord.ext import commands
+from discord.ui import Select, View, Button
+import aiohttp
+import random
+
+class Anime(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        if not hasattr(bot, "http_session") or bot.http_session is None:
+            bot.http_session = aiohttp.ClientSession()
+        self.sfw_actions = {
+            "Angry": "😡", "Baka": "🤦‍♂️", "Bite": "😈", "Blush": "😊", "Bonk": "🔨",
+            "Bored": "😐", "Bully": "😏", "Bye": "👋", "Chase": "🏃‍♂️", "Cheer": "🎉",
+            "Cringe": "😬", "Cry": "😢", "Cuddle": "🫂", "Dab": "💃", "Dance": "💃",
+            "Die": "💀", "Disgust": "🤢", "Facepalm": "🤦", "Feed": "🍪", "Glomp": "🤗",
+            "Happy": "😄", "Hi": "👋", "Highfive": "🙌", "Hold": "🤝", "Hug": "🤗",
+            "Kick": "🦵", "Kill": "🔪", "Kiss": "😘", "Laugh": "😂", "Lick": "😋",
+            "Love": "❤️", "Lurk": "👀", "Midfing": "🖕", "Nervous": "😰", "Nom": "🍪",
+            "Nope": "🙅‍♂️", "Nuzzle": "🐱", "Panic": "😱", "Pat": "🫶", "Peck": "😘",
+            "Poke": "👈", "Pout": "😡", "Punch": "👊", "Run": "🏃", "Sad": "😢",
+            "Shoot": "🔫", "Shrug": "🤷", "Sip": "🥤", "Slap": "👋", "Sleepy": "😴",
+            "Smile": "😄", "Smug": "😏", "Stab": "🔪", "Stare": "👀", "Suicide": "💀",
+            "Tease": "😏", "Think": "🤔", "Thumbsup": "👍", "Tickle": "😜",
+            "Triggered": "🚨", "Wag": "🐕", "Wave": "👋", "Wink": "😉", "Yes": "✅"
+        }
+        self.nsfw_actions = {
+            "Bite": "😈", "Slap": "👋", "Kick": "🦵", "Hug": "🤗", "Kiss": "😘",
+            "Waifu": "💖", "Neko": "🐱"
+        }
+        self.api_urls = [
+            "https://api.waifu.pics/{type}/{tag}",
+            "https://api.waifu.im/{type}/{tag}?many=false",
+            "https://anime-api.com/api/{type}/{tag}"  # Nekidev
+        ]
+        self.setup_commands()
+
+    # ---------------- Setup Commands ----------------
+    def setup_commands(self):
+        # Interacción unificada SFW
+        @app_commands.command(name="interact", description="Interactúa con alguien usando muchas acciones SFW")
+        @app_commands.describe(action="Selecciona la acción", user="Menciona a alguien (opcional)")
+        async def interact(interaction: discord.Interaction, action: str, user: discord.Member = None):
+            await interaction.response.defer()
+            emoji = self.sfw_actions.get(action, "")
+            img_url = await self.fetch_image(action.lower(), nsfw=False)
+            await self.send_embed(interaction, action, img_url, user, emoji, nsfw=False)
+        interact.autocomplete("action")(self.autocomplete_sfw)
+        self.bot.tree.add_command(interact)
+
+        # Interacción unificada NSFW
+        @app_commands.command(name="nsfw_interact", description="Interactúa NSFW (canales permitidos)")
+        @app_commands.describe(action="Selecciona la acción NSFW", user="Menciona a alguien (opcional)")
+        async def nsfw_interact(interaction: discord.Interaction, action: str, user: discord.Member = None):
+            await interaction.response.defer()
+            if not getattr(interaction.channel, "is_nsfw", lambda: False)():
+                await interaction.followup.send(
+                    embed=discord.Embed(title="🚫 Canal no permitido", description="Solo canales NSFW", color=discord.Color.red()),
+                    ephemeral=True
+                )
+                return
+            emoji = self.nsfw_actions.get(action, "")
+            img_url = await self.fetch_image(action.lower(), nsfw=True)
+            await self.send_embed(interaction, action, img_url, user, emoji, nsfw=True)
+        nsfw_interact.autocomplete("action")(self.autocomplete_nsfw)
+        self.bot.tree.add_command(nsfw_interact)
+
+        # Random SFW
+        @app_commands.command(name="random_sfw", description="Obtén una imagen SFW aleatoria")
+        async def random_sfw(interaction: discord.Interaction):
+            await interaction.response.defer()
+            tag = random.choice(list(self.sfw_actions.keys())).lower()
+            img_url = await self.fetch_image(tag, nsfw=False)
+            await self.send_embed(interaction, "Random", img_url, None, "", nsfw=False)
+        self.bot.tree.add_command(random_sfw)
+
+        # Trivia
+        @app_commands.command(name="trivia", description="Responde preguntas de trivia")
+        async def trivia(interaction: discord.Interaction):
+            await interaction.response.defer()
+            question, options, answer = await self.get_trivia_question()
+            view = TriviaView(interaction.user, options, answer)
+            await interaction.followup.send(content=question, view=view)
+        self.bot.tree.add_command(trivia)
+
+    # ---------------- Autocomplete ----------------
+    async def autocomplete_sfw(self, interaction: discord.Interaction, current: str):
+        return [app_commands.Choice(name=a, value=a) for a in self.sfw_actions if current.lower() in a.lower()]
+
+    async def autocomplete_nsfw(self, interaction: discord.Interaction, current: str):
+        return [app_commands.Choice(name=a, value=a) for a in self.nsfw_actions if current.lower() in a.lower()]
+
+    # ---------------- Fetch imágenes ----------------
+    async def fetch_image(self, tag: str, nsfw: bool = False) -> str | None:
+        urls = [u.format(type="nsfw" if nsfw else "sfw", tag=tag) for u in self.api_urls]
+        for url in urls:
+            try:
+                async with self.bot.http_session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if "images" in data and len(data["images"]) > 0:
+                            return data["images"][0]["url"]
+                        if "url" in data:
+                            return data["url"]
+            except Exception as e:
+                print(f"Error fetch [{tag}] [{url}]: {e}")
+        return None
+
+    # ---------------- Embeds ----------------
+    async def send_embed(self, interaction, action_name, img_url, user=None, emoji="", nsfw=False):
+        if not img_url:
+            await interaction.followup.send(f"❌ No se pudo obtener imagen {'NSFW' if nsfw else 'SFW'}.", ephemeral=True)
+            return
+        description = f"{interaction.user.mention} {action_name} {emoji}"
+        if user and user != interaction.user:
+            description = f"{interaction.user.mention} {action_name} a {user.mention} {emoji}"
+        color = discord.Color.dark_red() if nsfw else discord.Color.blurple()
+        embed = discord.Embed(description=description, color=color)
+        embed.set_image(url=img_url)
+        if nsfw:
+            embed.set_footer(text="🔞 Contenido solo para mayores de edad.")
+        await interaction.followup.send(embed=embed)
+
+    # ---------------- Trivia ----------------
+    async def get_trivia_question(self):
+        url = "https://opentdb.com/api.php?amount=1&type=multiple"
+        async with self.bot.http_session.get(url) as resp:
+            data = await resp.json()
+            q = data["results"][0]
+            question = q["question"]
+            options = q["incorrect_answers"] + [q["correct_answer"]]
+            random.shuffle(options)
+            answer = q["correct_answer"]
+            return question, options, answer
+
+# ---------------- Trivia View ----------------
+class TriviaView(View):
+    def __init__(self, user, options, answer):
+        super().__init__(timeout=30)
+        self.user = user
+        self.answer = answer
+        for opt in options:
+            self.add_item(TriviaButton(opt, answer, user))
+
+class TriviaButton(Button):
+    def __init__(self, label, answer, user):
+        super().__init__(label=label, style=discord.ButtonStyle.primary)
+        self.answer = answer
+        self.user = user
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user != self.user:
+            await interaction.response.send_message("❌ Esto no es para ti", ephemeral=True)
+            return
+        correct = self.label == self.answer
+        color = discord.Color.green() if correct else discord.Color.red()
+        msg = "✅ Correcto!" if correct else f"❌ Incorrecto! La respuesta era: {self.answer}"
+        embed = discord.Embed(title="Trivia", description=msg, color=color)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+# ---------------- Setup ----------------
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Anime(bot))
+    print("Cog Anime cargado ✅")

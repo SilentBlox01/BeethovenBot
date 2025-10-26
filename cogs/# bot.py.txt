@@ -1,0 +1,1043 @@
+# bot.py
+import os
+import logging
+import random
+import asyncio
+from datetime import datetime
+
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+from discord.ui import View, Button, Select
+
+import aiosqlite
+import aiohttp
+import qrcode
+import sympy
+from sympy import sin, cos, tan, log, ln, sqrt, pi, E, Pow
+from dotenv import load_dotenv
+# keep_alive import left as-is if you're using Replit/uptime services
+try:
+    from keep_alive import keep_alive
+except Exception:
+    keep_alive = lambda: None
+
+# ====== CONFIG & LOGGING ======
+load_dotenv()
+TOKEN = os.getenv("TOKEN") or os.environ.get("TOKEN")
+if not TOKEN:
+    raise RuntimeError("TOKEN no encontrado en variables de entorno.")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("BeethovenBot")
+
+DB_PATH = "bot.db"
+
+# ====== INTENTS ======
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True  # solo si necesitas miembros; desactiva si no
+bot = commands.Bot(command_prefix=None, intents=intents, case_insensitive=True, help_command=None)
+
+# ====== GLOBAL RESOURCES ======
+http_session: aiohttp.ClientSession | None = None
+# Cachés en memoria (evitan I/O constante)
+CACHE = {
+    "blacklist": set(),
+    "afk": {},  # user_id -> reason
+}
+
+# ====== UTIL: DB (aiosqlite) ======
+async def init_db():
+    """Crea tablas si no existen y carga caches en memoria."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS afk_users (
+                id_usuario INTEGER PRIMARY KEY,
+                razon TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blacklist (
+                user_id TEXT PRIMARY KEY
+            )
+        """)
+        await db.commit()
+        logger.info("Base de datos inicializada.")
+
+    # Cargar caches
+    await load_caches()
+
+async def load_caches():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM blacklist") as cursor:
+            rows = await cursor.fetchall()
+            CACHE["blacklist"] = set(r[0] for r in rows)
+        async with db.execute("SELECT id_usuario, razon FROM afk_users") as cursor:
+            rows = await cursor.fetchall()
+            CACHE["afk"] = {int(r[0]): r[1] for r in rows}
+    logger.info(f"Caches cargadas: blacklist={len(CACHE['blacklist'])}, afk={len(CACHE['afk'])}")
+
+async def add_blacklist(user_id: int):
+    uid = str(user_id)
+    if uid in CACHE["blacklist"]:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO blacklist (user_id) VALUES (?)", (uid,))
+        await db.commit()
+    CACHE["blacklist"].add(uid)
+    return True
+
+async def remove_blacklist(user_id: int):
+    uid = str(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM blacklist WHERE user_id = ?", (uid,))
+        await db.commit()
+    removed = uid in CACHE["blacklist"]
+    CACHE["blacklist"].discard(uid)
+    return removed
+
+async def set_afk(user_id: int, reason: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO afk_users (id_usuario, razon) VALUES (?, ?)", (user_id, reason))
+        await db.commit()
+    CACHE["afk"][int(user_id)] = reason
+
+async def remove_afk(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM afk_users WHERE id_usuario = ?", (user_id,))
+        await db.commit()
+    CACHE["afk"].pop(int(user_id), None)
+
+# ====== STARTUP / SHUTDOWN ======
+@bot.event
+async def on_ready():
+    global http_session
+    logger.info(f"{bot.user} is online - {datetime.utcnow().isoformat()}")
+    if http_session is None:
+        http_session = aiohttp.ClientSession()
+    await init_db()
+    # Fuerza la sincronización global de comandos
+    synced = await bot.tree.sync()
+    logger.info(f"Comandos sincronizados: {[cmd.name for cmd in synced]}")
+    await bot.change_presence(status=discord.Status.online, activity=discord.Game("/help"))
+    logger.info("Bot listo y sincronizado con comandos de aplicación.")
+
+    if "help" in bot.all_commands:
+        bot.remove_command("help")
+
+@bot.event
+async def on_close():
+    global http_session
+    if http_session:
+        await http_session.close()
+
+# ====== HELPERS ======
+async def fetch_json(url: str, timeout: int = 10):
+    """GET JSON usando session compartida."""
+    global http_session
+    if http_session is None:
+        http_session = aiohttp.ClientSession()
+    try:
+        async with http_session.get(url, timeout=timeout) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+    except Exception as e:
+        logger.error(f"HTTP GET error: {url} - {e}")
+        return None
+
+def make_embed(title: str, description: str | None = None, color: int = 0x2F3136):
+    e = discord.Embed(title=title, description=description or "", color=color)
+    e.timestamp = datetime.utcnow()
+    return e
+
+@bot.tree.command(name="ban", description="Banea a un miembro del servidor.")
+@app_commands.describe(member="El miembro a banear", reason="La razón del ban (opcional)")
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "Sin razón establecida."):
+    try:
+        await member.ban(reason=reason)
+        await interaction.response.send_message(f"{member.mention} fue baneado por {interaction.user.mention} por {reason}.")
+        logger.info(f"Usuario {member.id} baneado por {interaction.user.id}")
+    except Exception as e:
+        await interaction.response.send_message(f"Error al banear: {str(e)}", ephemeral=True)
+        logger.error(f"Error en ban: {str(e)}")
+
+@bot.tree.command(name="kick", description="Expulsa a un miembro del servidor.")
+@app_commands.describe(member="El miembro a expulsar", reason="La razón del kick (opcional)")
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "Sin razón establecida."):
+    try:
+        await member.kick(reason=reason)
+        await interaction.response.send_message(f"{member.mention} fue expulsado por {interaction.user.mention} por {reason}.")
+        logger.info(f"Usuario {member.id} expulsado por {interaction.user.id}")
+    except Exception as e:
+        await interaction.response.send_message(f"Error al expulsar: {str(e)}", ephemeral=True)
+        logger.error(f"Error en kick: {str(e)}")
+
+@bot.tree.command(name="unban", description="Revoca el ban de un usuario.")
+@app_commands.describe(user_id="El ID del usuario a desbanear")
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban(interaction: discord.Interaction, user_id: str):
+    try:
+        user = await bot.fetch_user(int(user_id))
+        await interaction.guild.unban(user)
+        await interaction.response.send_message(f"{user.mention} fue desbaneado por {interaction.user.mention}.")
+        logger.info(f"Usuario {user_id} desbaneado por {interaction.user.id}")
+    except Exception as e:
+        await interaction.response.send_message(f"Error al desbanear: {str(e)}", ephemeral=True)
+        logger.error(f"Error en unban: {str(e)}")
+
+
+@bot.tree.command(name="blacklistadd", description="Añade un usuario a la lista negra.")
+@app_commands.describe(user_id="El ID del usuario")
+@app_commands.checks.has_permissions(administrator=True)
+async def blacklistadd(interaction: discord.Interaction, user_id: str):
+    try:
+        user_id_int = int(user_id)
+        if await add_blacklist(user_id_int):
+            await interaction.response.send_message(f"El usuario `{user_id}` ha sido añadido a la lista negra.")
+            logger.info(f"Usuario {user_id} añadido a blacklist por {interaction.user.id}")
+        else:
+            await interaction.response.send_message(f"El usuario `{user_id}` ya estaba en la lista negra.", ephemeral=True)
+    except ValueError:
+        await interaction.response.send_message("Por favor, introduce un ID de usuario válido.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error al añadir a la lista negra: {e}", ephemeral=True)
+
+@bot.tree.command(name="blacklistremove", description="Elimina un usuario de la lista negra.")
+@app_commands.describe(user_id="El ID del usuario")
+@app_commands.checks.has_permissions(administrator=True)
+async def blacklistremove(interaction: discord.Interaction, user_id: str):
+    try:
+        user_id_int = int(user_id)
+        if await remove_blacklist(user_id_int):
+            await interaction.response.send_message(f"El usuario `{user_id}` ha sido eliminado de la lista negra.")
+            logger.info(f"Usuario {user_id} eliminado de blacklist por {interaction.user.id}")
+        else:
+            await interaction.response.send_message(f"El usuario `{user_id}` no se encontró en la lista negra.", ephemeral=True)
+    except ValueError:
+        await interaction.response.send_message("Por favor, introduce un ID de usuario válido.", ephemeral=True)
+
+@bot.tree.command(name="say", description="Haz que el bot diga lo que quieras.")
+@app_commands.describe(text="El texto que quieres que el bot diga.")
+@app_commands.checks.has_permissions(administrator=True)
+async def say(interaction: discord.Interaction, text: str):
+    await interaction.response.send_message("✅ Mensaje enviado.", ephemeral=True)
+    await interaction.channel.send(text)
+
+# Manejo de error si el usuario no tiene permisos
+@say.error
+async def say_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "🚫 No tienes permisos de administrador para usar este comando.",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="purge", description="Elimina mensajes del canal.")
+@app_commands.describe(amount="Cantidad de mensajes a eliminar (1-100).")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def purge(interaction: discord.Interaction, amount: int):
+    if amount < 1 or amount > 100:
+        await interaction.response.send_message(
+            "🚫 Debes ingresar un número entre 1 y 100.", ephemeral=True
+        )
+        return
+
+    deleted = await interaction.channel.purge(limit=amount)
+    await interaction.response.send_message(
+        f"✅ Se eliminaron {len(deleted)} mensajes.", ephemeral=True
+    )
+
+# Manejo de errores
+@purge.error
+async def purge_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "🚫 No tienes permisos para administrar mensajes.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"❌ Ocurrió un error: {error}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="serverinfo", description="Muestra la información avanzada del servidor.")
+@app_commands.checks.has_permissions(administrator=True)
+async def serverinfo(interaction: discord.Interaction):
+    guild = interaction.guild
+    owner = guild.owner  # <-- corregido
+    created_at = guild.created_at.strftime("%d/%m/%Y %H:%M:%S")
+    humans = len([m for m in guild.members if not m.bot])
+    bots = len([m for m in guild.members if m.bot])
+    roles_count = len(guild.roles)
+    channels_count = len(guild.channels)
+    emojis_count = len(guild.emojis)
+    verification = str(guild.verification_level).title()
+    region = getattr(guild, "region", "Desconocida")
+    icon_url = guild.icon.url if guild.icon else None
+
+    embed = make_embed("Información del servidor", color=discord.Color.blurple().value)
+    embed.set_thumbnail(url=icon_url)
+    embed.add_field(name="Nombre", value=guild.name, inline=True)
+    embed.add_field(name="ID", value=guild.id, inline=True)
+    embed.add_field(name="Propietario", value=f"{owner} ({owner.id})", inline=True)
+    embed.add_field(name="Creado el", value=created_at, inline=True)
+    embed.add_field(name="Miembros", value=f"Total: {guild.member_count}\nHumanos: {humans}\nBots: {bots}", inline=True)
+    embed.add_field(name="Roles", value=roles_count, inline=True)
+    embed.add_field(name="Canales", value=channels_count, inline=True)
+    embed.add_field(name="Emojis", value=emojis_count, inline=True)
+    embed.add_field(name="Nivel de verificación", value=verification, inline=True)
+    embed.add_field(name="Región", value=region, inline=True)
+    embed.add_field(name="Pedido por", value=interaction.user.mention, inline=False)
+    embed.set_footer(text="Creado con amor")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="userinfo", description="Consigue información de un usuario.")
+@app_commands.describe(member="El miembro a consultar (opcional, por defecto tú)")
+async def userinfo(interaction: discord.Interaction, member: discord.Member | None = None):
+    member = member or interaction.user
+    if member == bot.user:
+        await interaction.response.send_message("¿Qué quieres saber? Si soy yo misma :D")
+        return
+
+    embed = make_embed(f"Info de {member}", color=0x00f549)
+    embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
+    embed.add_field(name="Nombre de usuario", value=str(member), inline=True)
+    embed.add_field(name="Apodo", value=member.display_name or "Ninguno", inline=True)
+    embed.add_field(name="ID", value=member.id, inline=True)
+    embed.add_field(name="Bot", value="Sí" if member.bot else "No", inline=True)
+    embed.add_field(name="Cuenta creada", value=member.created_at.strftime("%d/%m/%Y %H:%M:%S"), inline=True)
+    if member.joined_at:
+        embed.add_field(name="Ingresó al servidor", value=member.joined_at.strftime("%d/%m/%Y %H:%M:%S"), inline=True)
+    embed.add_field(name="Estado", value=getattr(member.status, "name", "Desconocido").title(), inline=True)
+    activity = getattr(member.activity, "name", None) or "Ninguna"
+    embed.add_field(name="Actividad", value=activity, inline=True)
+    embed.add_field(name="Booster", value="Sí" if member.premium_since else "No", inline=True)
+    embed.add_field(name="AFK", value="Sí" if member.id in CACHE["afk"] else "No", inline=True)
+
+    # Roles (máximo 10 para evitar embeds largos)
+    roles = [r.mention for r in member.roles if not r.is_default()]
+    if roles:
+        roles_text = ", ".join(roles[:10])
+        if len(roles) > 10:
+            roles_text += f" y {len(roles)-10} más..."
+    else:
+        roles_text = "Ninguno"
+    embed.add_field(name="Roles", value=roles_text, inline=False)
+
+    # Permisos principales
+    perms = []
+    if member.guild_permissions.administrator: perms.append("Administrador")
+    if member.guild_permissions.manage_guild: perms.append("Gestiona servidor")
+    if member.guild_permissions.ban_members: perms.append("Banear")
+    if member.guild_permissions.kick_members: perms.append("Expulsar")
+    if member.guild_permissions.manage_messages: perms.append("Gestiona mensajes")
+    if member.guild_permissions.manage_roles: perms.append("Gestiona roles")
+    if perms:
+        embed.add_field(name="Permisos principales", value=", ".join(perms), inline=False)
+
+    # Banner si existe
+    try:
+        user_obj = await interaction.client.fetch_user(member.id)
+        if hasattr(user_obj, "banner") and user_obj.banner:
+            embed.set_image(url=user_obj.banner.url)
+    except Exception:
+        pass
+
+    embed.set_footer(text=f"Solicitado por {interaction.user}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="avatar", description="Muestra el avatar de un usuario")
+@app_commands.describe(member="El miembro (opcional, por defecto tú)")
+async def avatar(interaction: discord.Interaction, member: discord.Member | None = None):
+    member = member or interaction.user
+    embed = make_embed(f"Avatar de {member}", color=discord.Color.purple().value)
+    embed.set_image(url=member.avatar.url if member.avatar else member.default_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="morse", description="Convierte un texto a código Morse.")
+@app_commands.describe(message="El mensaje a convertir")
+async def morse(interaction: discord.Interaction, message: str):
+    morse_code = { 'a': '.-', 'b': '-...', 'c': '-.-.', 'd': '-..', 'e': '.', 'f': '..-.',
+                   'g': '--.', 'h': '....', 'i': '..', 'j': '.---','k': '-.-', 'l': '.-..',
+                   'm': '--', 'n': '-.', 'o': '---', 'p': '.--.', 'q': '--.-', 'r': '.-.',
+                   's': '...', 't': '-', 'u': '..-', 'v': '...-', 'w': '.--', 'x': '-..-',
+                   'y': '-.--', 'z': '--..', '0': '-----', '1': '.----', '2': '..---',
+                   '3': '...--', '4': '....-', '5': '.....', '6': '-....', '7': '--...',
+                   '8': '---..', '9': '----.', '.': '.-.-.-', ',': '--..--', '?': '..--..',
+                   '!': '-.-.--', '-': '-....-', '/': '-..-.', '@': '.--.-.', '(': '-.--.',
+                   ')': '-.--.-', ' ': '/'
+                 }
+    morse_message = ' '.join(morse_code.get(c, c) for c in message.lower())
+    await interaction.response.send_message(morse_message)
+
+@bot.tree.command(name="qr", description="Genera un código QR a partir de un texto.")
+@app_commands.describe(text="El texto para el QR")
+async def qr_cmd(interaction: discord.Interaction, text: str):
+    # genera qr en memoria y envía (no escribe al disco)
+    try:
+        import io
+        img = qrcode.make(text)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        file = discord.File(buf, filename="qr.png")
+        await interaction.response.send_message(file=file)
+    except Exception as e:
+        await interaction.response.send_message(f"Error al generar QR: {e}", ephemeral=True)
+        logger.exception("Error en QR")
+
+class AdvancedCalcView(View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.expression = ""
+
+        # Máximo 25 botones, asegurando que "=" esté incluido
+        buttons = [
+            ["7","8","9","/","sin"],
+            ["4","5","6","*","cos"],
+            ["1","2","3","-","tan"],
+            ["0",".","(","+",")"],
+            ["C","^","√","ln","="]  # 7 botones, total: 25
+        ]
+
+        total = 0
+        for row_idx, row in enumerate(buttons):
+            for btn in row:
+                if total < 25:
+                    self.add_item(AdvancedCalcButton(btn, self, row=row_idx))
+                    total += 1
+
+class AdvancedCalcButton(Button):
+    def __init__(self, label, view: AdvancedCalcView, row: int = 0):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=row)
+        self.view_ref = view
+
+    async def callback(self, interaction: discord.Interaction):
+        expr = self.view_ref.expression
+
+        if self.label == "C":
+            self.view_ref.expression = ""
+        elif self.label == "DEL":
+            self.view_ref.expression = expr[:-1]
+        elif self.label == "=":
+            try:
+                # Mapeamos funciones seguras
+                allowed_symbols = {
+                    "sin": sin, "cos": cos, "tan": tan,
+                    "log": log, "ln": ln, "√": sqrt,
+                    "pi": pi, "e": E, "^": Pow
+                }
+                # Reemplazamos el símbolo √ por sqrt() para sympy
+                safe_expr = expr.replace("√", "sqrt")
+                safe_expr = safe_expr.replace("^", "**")
+                result = sympy.sympify(safe_expr, locals=allowed_symbols).evalf()
+                self.view_ref.expression = str(result)
+            except Exception:
+                self.view_ref.expression = "Error"
+        else:
+            self.view_ref.expression += self.label
+
+        embed = discord.Embed(
+            title="🧮 Calculadora Científica",
+            description=f"```{self.view_ref.expression}```",
+            color=discord.Color.blurple()
+        )
+        await interaction.response.edit_message(embed=embed, view=self.view_ref)
+
+# Comando de barra para abrir la calculadora avanzada
+@bot.tree.command(name="calc", description="Calculadora científica avanzada")
+async def calc(interaction: discord.Interaction):
+    view = AdvancedCalcView()
+    embed = discord.Embed(
+        title="🧮 Calculadora Científica Avanzada",
+        description="```0```",
+        color=discord.Color.blurple()
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+
+# ====== AFK / MESSAGE HANDLING ======
+@bot.tree.command(name="afk", description="Establece un estado de ausencia.")
+@app_commands.describe(message="La razón de tu AFK (opcional)")
+async def afk(interaction: discord.Interaction, message: str = ""):
+    await set_afk(interaction.user.id, message)
+    await interaction.response.send_message(f"{interaction.user.mention} está ahora AFK: {message}")
+    logger.info(f"Usuario {interaction.user.id} establecido como AFK")
+
+@bot.tree.command(name="unafk", description="Quita el estado de ausencia.")
+async def unafk(interaction: discord.Interaction):
+    await remove_afk(interaction.user.id)
+    await interaction.response.send_message(f"{interaction.user.mention} ya no está AFK.")
+    logger.info(f"Usuario {interaction.user.id} removido de AFK")
+
+@bot.event
+async def on_message(message: discord.Message):
+    # evita bloquear con operaciones I/O sin await
+    if message.author.bot:
+        return
+
+    # blacklist check (cache rápido)
+    if str(message.author.id) in CACHE["blacklist"]:
+        try:
+            await message.channel.send(f"Lo siento, {message.author.mention}, estás en la lista negra.")
+        except Exception:
+            pass
+        return
+
+    # soporte para prefijo legacy m/afk (si prefieres mantenerlo)
+    if message.content.startswith("m/afk "):
+        razon = message.content[6:].strip()
+        await set_afk(message.author.id, razon)
+        await message.channel.send(f"{message.author.mention} está ahora AFK: {razon}")
+        return
+
+    # si el autor estaba en AFK, lo removemos
+    if message.author.id in CACHE["afk"]:
+        await remove_afk(message.author.id)
+        await message.channel.send(f"{message.author.mention} ya no está AFK.")
+
+    # avisar si mencionaron a alguien AFK
+    if message.mentions:
+        for m in message.mentions:
+            if m.bot:
+                continue
+            reason = CACHE["afk"].get(int(m.id))
+            if reason is not None:
+                await message.channel.send(f"{message.author.mention}, {m.mention} está AFK: {reason}")
+
+    # deja que discord.py procese comandos/registros de slash
+    await bot.process_commands(message)
+
+
+
+# ====== DIVERSION ======
+@bot.tree.command(name="hello", description="El bot te saluda.")
+async def hello(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Hola {interaction.user.mention}! ¿Qué tal?")
+
+@bot.tree.command(name="bola8", description="Pregúntale algo a la bola 8.")
+@app_commands.describe(question="Tu pregunta")
+async def bola8(interaction: discord.Interaction, question: str):
+    responses = ["Sí", "No", "Quizás", "Probablemente", "No lo sé", "Absolutamente", "Nunca", "Tal vez"]
+    await interaction.response.send_message(f"🎱 **Pregunta:** {question}\n🎱 **Respuesta:** {random.choice(responses)}")
+
+# RPS & Guess simplified (mismo comportamiento pero con async-safe waiters)
+@bot.tree.command(name="rps", description="Juega piedra, papel o tijera con el bot.")
+async def rps(interaction: discord.Interaction):
+    emojis = ['🪨', '📜', '✂️']
+    results = ['Empate', 'Ganaste', 'Perdiste']
+
+    def check_win(p1, p2):
+        if p1 == p2:
+            return results[0]
+        win_conditions = {emojis[0]: emojis[2], emojis[1]: emojis[0], emojis[2]: emojis[1]}
+        return results[1] if win_conditions[p1] == p2 else results[2]
+
+    embed = discord.Embed(title="Piedra, Papel o Tijera", description="Reacciona para jugar:", color=discord.Color.green())
+    embed.add_field(name="Piedra", value=emojis[0], inline=True)
+    embed.add_field(name="Papel", value=emojis[1], inline=True)
+    embed.add_field(name="Tijera", value=emojis[2], inline=True)
+
+    await interaction.response.send_message(embed=embed)
+    msg = await interaction.original_response()
+
+    for emoji in emojis:
+        await msg.add_reaction(emoji)
+
+    def check(reaction, user):
+        return user == interaction.user and str(reaction.emoji) in emojis and reaction.message.id == msg.id
+
+    try:
+        reaction, _ = await bot.wait_for('reaction_add', timeout=30.0, check=check)
+    except asyncio.TimeoutError:
+        await interaction.followup.send(f"{interaction.user.mention}, tiempo agotado.")
+    else:
+        bot_choice = random.choice(emojis)
+        result = check_win(str(reaction.emoji), bot_choice)
+        embed_result = discord.Embed(title="Resultado", color=discord.Color.green())
+        embed_result.add_field(name="Tu elección", value=str(reaction.emoji), inline=True)
+        embed_result.add_field(name="Elección del bot", value=bot_choice, inline=True)
+        embed_result.add_field(name="Resultado", value=result, inline=True)
+        await interaction.followup.send(embed=embed_result)
+
+@bot.tree.command(name="guess", description="Adivina un número del 1 al 50. Tienes varios intentos.")
+@app_commands.describe(dificultad="Elige la dificultad: facil, medio, dificil")
+async def guess(interaction: discord.Interaction, dificultad: str = "medio"):
+    ranges = {"facil": 10, "medio": 30, "dificil": 50}
+    max_num = ranges.get(dificultad.lower(), 30)
+    num = random.randint(1, max_num)
+    attempts = {"facil": 5, "medio": 7, "dificil": 10}.get(dificultad.lower(), 7)
+
+    await interaction.response.send_message(f"¡Adivina un número del 1 al {max_num}! Tienes {attempts} intentos.")
+
+    def check(msg):
+        return msg.author == interaction.user and msg.channel == interaction.channel and msg.content.isdigit()
+
+    for i in range(attempts):
+        try:
+            msg = await bot.wait_for('message', check=check, timeout=30)
+            guess = int(msg.content)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⏳ Tiempo agotado.")
+            return
+
+        if guess == num:
+            await interaction.followup.send(f"🎉 ¡Felicidades {interaction.user.mention}! Adivinaste en {i+1} intentos.")
+            return
+
+        hint = "mayor" if guess < num else "menor"
+        emoji_hint = "🔺" if guess < num else "🔻"
+        await interaction.followup.send(f"Mi número es {hint} {emoji_hint}. Intenta de nuevo! ({attempts-i-1} intentos restantes)")
+
+    await interaction.followup.send(f"💀 Agotaste todos los intentos. El número era {num}.")
+
+# ====== ANIME / IMAGENES ======
+@bot.tree.command(name="aniinfo", description="Obtén información detallada de un anime.")
+@app_commands.describe(anime_name="Nombre del anime a buscar")
+async def aniinfo(interaction: discord.Interaction, anime_name: str):
+    await interaction.response.defer()
+    try:
+        data = await fetch_json(f"https://api.jikan.moe/v4/anime?q={anime_name}&limit=1")
+        results = data.get("data", [])
+        if not results:
+            await interaction.followup.send("❌ No encontré resultados.", ephemeral=True)
+            return
+
+        anime = results[0]
+        synopsis = anime.get("synopsis", "Sin sinopsis disponible.") or "Sin sinopsis disponible."
+        type_ = anime.get("type", "Desconocido")
+        episodes = anime.get("episodes", "Desconocido")
+        score = anime.get("score", "Desconocido")
+        start_date = anime.get("aired", {}).get("from", "Desconocida")
+        status = anime.get("status", "Desconocido")
+        image_url = anime.get("images", {}).get("jpg", {}).get("image_url")
+
+        # Truncar sinopsis si es muy larga
+        if len(synopsis) > 300:
+            synopsis = synopsis[:300] + "..."
+
+        embed = discord.Embed(
+            title=anime.get("title", "Desconocido"),
+            url=anime.get("url"),
+            description=synopsis,
+            color=0x9208ea
+        )
+        embed.add_field(name="Tipo", value=type_, inline=True)
+        embed.add_field(name="Episodios", value=episodes, inline=True)
+        embed.add_field(name="Puntuación", value=score, inline=True)
+        embed.add_field(name="Fecha de estreno", value=start_date, inline=True)
+        embed.add_field(name="Estado", value=status, inline=True)
+
+        if image_url:
+            embed.set_thumbnail(url=image_url)
+
+        embed.set_footer(text=f"Solicitud de {interaction.user}", icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error al buscar anime: {str(e)}", ephemeral=True)
+        logger.error(f"Error en aniinfo: {str(e)}")
+
+
+# ------------------------ FUNCIÓN PARA OBTENER IMAGEN ------------------------
+async def fetch_waifu_image(action: str, nsfw: bool = False):
+    """Obtiene una imagen de waifu.pics para la acción dada."""
+    tipo = "nsfw" if nsfw else "sfw"
+    url = f"https://api.waifu.pics/{tipo}/{action}"
+    data = await fetch_json(url)
+    if data and "url" in data:
+        return data["url"]
+    return None
+
+# ------------------------ FUNCIÓN PARA ENVIAR EMBED SFW ------------------------
+async def send_action_embed(
+    interaction: discord.Interaction,
+    action_name: str,
+    img_url: str,
+    target: discord.Member | None = None,
+    emoji: str = "",
+):
+    if not img_url:
+        await interaction.followup.send("❌ Error al obtener imagen.", ephemeral=True)
+        return
+
+    description = (
+        f"{interaction.user.mention} {action_name} {emoji}"
+        if not target or target == interaction.user
+        else f"{interaction.user.mention} {action_name} a {target.mention} {emoji}"
+    )
+
+    embed = discord.Embed(description=description, color=discord.Color.blurple())
+    embed.set_image(url=img_url)
+
+    await interaction.followup.send(embed=embed)
+
+
+# ------------------------ FUNCIÓN PARA ENVIAR EMBED NSFW ------------------------
+async def send_nsfw_embed(
+    interaction: discord.Interaction,
+    action_text: str,
+    img_url: str,
+    target: discord.Member | None = None,
+    emoji: str = "🔞",
+):
+    if not img_url:
+        await interaction.followup.send("❌ No se pudo obtener imagen NSFW.", ephemeral=True)
+        return
+
+    description = (
+        f"{interaction.user.mention} {action_text}"
+        + (f" a {target.mention}" if target and target != interaction.user else "")
+        + f" {emoji}"
+    )
+
+    embed = discord.Embed(description=description, color=discord.Color.dark_red())
+    embed.set_image(url=img_url)
+    embed.set_footer(text="🔞 Contenido solo para mayores de edad.")
+
+    await interaction.followup.send(embed=embed)
+
+
+# ------------------------ COMANDOS SFW ------------------------
+def setup_anime_commands(bot: commands.Bot):
+    # --- Factory para comandos SFW ---
+    def create_sfw_command(name: str, action: str, emoji: str):
+        @app_commands.describe(target="Menciona a alguien (opcional)")
+        async def _command(interaction: discord.Interaction, target: discord.Member | None = None):
+            await interaction.response.defer()
+            img_url = await fetch_waifu_image(name)
+            await send_action_embed(interaction, action, img_url, target, emoji)
+        return _command
+
+    acciones_sfw = {
+        "blush": ("se sonroja", "😊"),
+        "wink": ("guiña el ojo", "😉"),
+        "pat": ("acaricia", "🫶"), "hug": ("abraza", "🤗"), "poke": ("toca", "👈"),
+        "smile": ("sonríe", "😄"), "wave": ("saluda", "👋"), "highfive": ("choca los cinco", "🙌"),
+        "handhold": ("toma la mano", "🤝"), "nom": ("muerde suavemente", "🍪"), "bite": ("muerde", "😈"),
+        "slap": ("da una bofetada", "👋"), "pokekick": ("da una patada", "🦵"), "happy": ("muestra felicidad", "😄"),
+        "cry": ("llora", "😢"), "dance": ("baila", "💃"), "cuddle": ("acurruca", "🫂"),
+        "yeet": ("lanza", "🪁"), "kiss": ("besa", "😘"), "waifu": ("muestra una waifu", "💖"),
+        "neko": ("muestra una neko", "🐱"),
+    }
+
+    for nombre, (accion, emoji) in acciones_sfw.items():
+        command_callback = create_sfw_command(nombre, accion, emoji)
+        bot.tree.add_command(app_commands.Command(name=nombre, description=f"{accion.capitalize()}.", callback=command_callback))
+
+    # --- Factory para comandos NSFW ---
+    def create_nsfw_command(name: str, action: str, emoji: str):
+        @app_commands.describe(target="Menciona a alguien (opcional)")
+        async def _command(interaction: discord.Interaction, target: discord.Member | None = None):
+            await interaction.response.defer()
+            if not interaction.channel.is_nsfw():
+                embed = discord.Embed(
+                    title="🚫 Canal no permitido",
+                    description="Este comando solo puede usarse en canales marcados como **NSFW**.",
+                    color=discord.Color.red(),
+                )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            img_url = await fetch_waifu_image(name, nsfw=True)
+            await send_nsfw_embed(interaction, action, img_url, target, emoji)
+        return _command
+
+    acciones_nsfw = {
+        "waifu": ("muestra su lado NSFW", "🌙"),
+        "neko": ("se transforma en neko sensual", "🐾"),
+        "blowjob": ("da un momento íntimo intenso", "💦"),
+    }
+
+    for nombre, (accion, emoji) in acciones_nsfw.items():
+        command_callback = create_nsfw_command(nombre, accion, emoji)
+        command_name = f"nsfw_{nombre}"
+        bot.tree.add_command(app_commands.Command(name=command_name, description=f"{accion.capitalize()} (solo canales NSFW).", callback=command_callback))
+
+# ====== MISC ======
+@bot.tree.command(name="sobremi", description="Muestra información sobre el bot.")
+async def sobremi(interaction: discord.Interaction):
+    embed = make_embed("Acerca de mí", color=discord.Color.random().value)
+    embed.set_thumbnail(url=bot.user.avatar.url)
+    embed.add_field(name="Nombre", value=bot.user.name, inline=True)
+    embed.add_field(name="Creador", value="Beethoven", inline=True)
+    embed.add_field(name="Lenguaje", value="Python 3.10+", inline=True)
+    embed.add_field(name="Librería", value=f"discord.py {discord.__version__}", inline=True)
+    embed.add_field(name="Servidores", value=len(bot.guilds), inline=True)
+    embed.add_field(name="Usuarios (únicos)", value=len({m.id for g in bot.guilds for m in g.members}), inline=True)
+    embed.add_field(name="Comandos", value=len(bot.tree.get_commands()), inline=True)
+    embed.set_footer(text="¡Gracias por usar este software ^~^!")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="invite", description="Enlace para invitar al bot.")
+async def invite(interaction: discord.Interaction):
+    embed = make_embed("¡Invítame!", "Haz clic para invitarme.", color=discord.Color.green().value)
+    embed.add_field(name="Enlace", value="[Invitar](https://discord.com/oauth2/authorize?client_id=872866276232540190&scope=bot&permissions=2147483647)", inline=False)
+    embed.set_thumbnail(url="https://i.imgur.com/fu3yit1.png")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="soporte", description="Servidor de soporte.")
+async def soporte(interaction: discord.Interaction):
+    embed = make_embed("Soporte", "Únete para ayuda.", color=discord.Color.blue().value)
+    embed.add_field(name="Enlace", value="https://discord.gg/PvJNZQUQGf", inline=False)
+    embed.set_footer(text="¡Únete ahora!")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="dev", description="Info sobre el desarrollador.")
+async def creador(interaction: discord.Interaction):
+    embed = make_embed("Información del desarrollador", "Hola, soy Beethoven, creador del bot.", color=0xff69b4)
+    embed.set_thumbnail(url="https://cdn.discordapp.com/avatars/719366657558052944/0cc0749bb66fc9dabcc678983192f797.png?size=1024")
+    embed.add_field(name="Usuario", value="Shangonomiya#2937", inline=False)
+    embed.add_field(name="Lenguaje", value="Python con discord.py v2.x", inline=False)
+    embed.add_field(name="Descripción", value="Bot para diversión y moderación. En desarrollo con chatbot planeado.", inline=False)
+    embed.add_field(name="Agradecimientos", value="A Whigrey y Hizer por ayuda.", inline=False)
+    embed.add_field(name="Redes", value="[Twitter](https://twitter.com/S_Kitty05) [YouTube](https://www.youtube.com/channel/UCCawTLnpgbc7_ltyGScoQpw)", inline=False)
+    embed.set_footer(text="En desarrollo, posibles errores.")
+    await interaction.response.send_message(embed=embed)
+
+from discord.ui import View, Button
+from discord import Embed, Interaction
+import discord
+
+class TutorialView(View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.page = 0
+
+        # Páginas del tutorial
+        self.pages = [
+            Embed(
+                title="📘 Tutorial de /calc",
+                description=(
+                    "Bienvenido al **tutorial del comando `/cal`**.\n\n"
+                    "Este comando te permite realizar **operaciones matemáticas** directamente desde Discord.\n"
+                    "Usa expresiones simples o funciones avanzadas como si estuvieras en una calculadora científica 🧮."
+                ),
+                color=discord.Color.blurple()
+            ),
+            Embed(
+                title="➕ Operaciones básicas",
+                description=(
+                    "**Suma (+)** → `2 + 3` = **5**\n"
+                    "**Resta (-)** → `8 - 4` = **4**\n"
+                    "**Multiplicación (*)** → `6 * 7` = **42**\n"
+                    "**División (/)** → `9 / 3` = **3.0**\n"
+                    "**Potencia (^)** → `2 ** 3` = **8**\n\n"
+                    "💡 Consejo: Usa paréntesis para agrupar operaciones, ejemplo:\n"
+                    "`(3 + 2) * 5` = **25**"
+                ),
+                color=discord.Color.green()
+            ),
+            Embed(
+                title="🔢 Funciones avanzadas",
+                description=(
+                    "Puedes usar **funciones matemáticas** del módulo `math`:\n\n"
+                    "📏 `sqrt(x)` → Raíz cuadrada\n"
+                    "🌀 `sin(x)`, `cos(x)`, `tan(x)` → Trigonometría (en radianes)\n"
+                    "📈 `ln(x)` → Logaritmo natural (base *e*)\n"
+                    "🎯 `^(x, y)` → Potencia de `x` elevado a `y`\n"
+                    "Ejemplo: `sin(3.1416/2)` = **1.0**"
+                ),
+                color=discord.Color.orange()
+            ).set_footer(
+                text="Nota: No pudimos agregar algunos simbolos o funciones como 'rad,' 'pi,' o 'e' debido a las limitaciones de Discord. Sin embargo seguimos trabajando para poder agregar muchas mas funciones. "
+                "" 
+                "Siempre usa los parentesis '()' al usar funciones como sin o cos para obtener un resultado y evitar errores. \n"
+            ),
+            Embed(
+                title="💡 Ejemplos prácticos",
+                description=(
+                    "Aquí tienes algunos ejemplos listos para usar:\n\n"
+                    "🔹 `/calculate expression: 2+2`\n"
+                    "→ **Resultado:** 4\n\n"
+                    "🔹 `/calculate expression: sqrt(16)`\n"
+                    "→ **Resultado:** 4\n\n"
+                    "🔹 `/calculate expression: sin(3.1416/2)`\n"
+                    "→ **Resultado:** 1.0\n\n"
+                    "🚀 ¡Y listo! Ahora puedes usar `/calculate` para resolver cualquier expresión matemática."
+                ),
+                color=discord.Color.purple()
+            )
+        ]
+
+        self.add_item(PrevButton(self))
+        self.add_item(NextButton(self))
+
+class PrevButton(Button):
+    def __init__(self, tutorial_view):
+        super().__init__(label="⏪ Anterior", style=discord.ButtonStyle.secondary)
+        self.view_ref = tutorial_view
+
+    async def callback(self, interaction: Interaction):
+        self.view_ref.page = (self.view_ref.page - 1) % len(self.view_ref.pages)
+        await interaction.response.edit_message(embed=self.view_ref.pages[self.view_ref.page], view=self.view_ref)
+
+class NextButton(Button):
+    def __init__(self, tutorial_view):
+        super().__init__(label="Siguiente ⏩", style=discord.ButtonStyle.secondary)
+        self.view_ref = tutorial_view
+
+    async def callback(self, interaction: Interaction):
+        self.view_ref.page = (self.view_ref.page + 1) % len(self.view_ref.pages)
+        await interaction.response.edit_message(embed=self.view_ref.pages[self.view_ref.page], view=self.view_ref)
+
+@bot.tree.command(name="calculate_tutorial", description="Muestra un tutorial sobre cómo usar el comando /calc.")
+async def calculate_tutorial(interaction: Interaction):
+    view = TutorialView()
+    await interaction.response.send_message(embed=view.pages[0], view=view, ephemeral=False)
+
+
+from discord.ui import View, Button, Select
+
+# View principal de ayuda
+class HelpView(View):
+    def __init__(self, commands_list):
+        super().__init__(timeout=120)
+        self.commands_list = commands_list
+        self.embed = discord.Embed(
+            title="📚 Menú de ayuda",
+            description="Selecciona una categoría para ver los comandos.",
+            color=discord.Color.blurple()
+        )
+        self.embed.set_footer(text="Hola :D")
+
+        # Categorías definidas
+        categories = {
+            "Moderación": [],
+            "Utilidad": [],
+            "Diversión": [],
+            "Anime": [],
+            "Interaccion": [],
+            "Mas Interaccion": [],
+            "NSFW": [],
+            "Otros": []
+        }
+
+        for cmd in commands_list:
+            cat = getattr(cmd, "category", None)
+            if not cat:
+                if cmd.name in ["ban", "kick", "unban", "purge", "blacklistadd", "blacklistremove"]:
+                    cat = "Moderación"
+                elif cmd.name in ["ping", "userinfo", "serverinfo", "calculate", "qr", "avatar", "afk", "unafk", "calculate_tutorial"]:
+                    cat = "Utilidad"
+                elif cmd.name in ["nsfw_neko", "nsfw_waifu", "blowjob"]:
+                    cat = "NSFW"
+                elif cmd.name in ["hello", "say", "bola8", "rps", "guess"]:
+                    cat = "Diversión"
+                elif cmd.name in ["blush", "wink", "pat", "hug", "kiss", "poke", 'smile', 'wave', 'highfive', 'handhold', 'nom', 'bite']:
+                        cat = "Interaccion"
+                elif cmd.name in ['slap', 'kick', 'happy', 'cry', 'dance', 'cuddle', 'yeet', 'kiss', 'waifu', 'neko']:
+                        cat = "Mas Interaccion" # 'kick' está duplicado, lo he renombrado a 'pokekick' en acciones_sfw
+                elif cmd.name in ["aniinfo"]:  # agrega tus comandos de anime/imágenes
+                    cat = "Anime"
+                else:
+                    cat = "Otros"
+            categories[cat].append(cmd)
+
+        # Crear un botón por categoría
+        for cat_name, cmds in categories.items():
+            if cmds:
+                self.add_item(CategoryButton(cat_name, cmds))
+
+
+# Botón por categoría
+class CategoryButton(Button):
+    def __init__(self, category_name, cmds):
+        super().__init__(label=category_name, style=discord.ButtonStyle.primary)
+        self.cmds = cmds
+
+    async def callback(self, interaction: discord.Interaction):
+        cmds_per_page = 25
+        total_pages = (len(self.cmds) - 1) // cmds_per_page + 1
+        page = 0
+
+        def get_options(page):
+            start = page * cmds_per_page
+            end = start + cmds_per_page
+            return [
+                discord.SelectOption(
+                    label=cmd.name,
+                    description=(cmd.description[:50] if cmd.description else "Sin descripción"),
+                    value=cmd.name
+                ) for cmd in sorted(self.cmds, key=lambda c: c.name)[start:end]
+            ]
+
+        options = get_options(page)
+        select = Select(placeholder=f"Selecciona un comando de {self.label}", options=options)
+
+        async def select_callback(select_interaction: discord.Interaction):
+            cmd_name = select_interaction.data["values"][0]
+            cmd = next(c for c in self.cmds if c.name == cmd_name)
+            embed = discord.Embed(
+                title=f"🛠️ Ayuda: /{cmd.name}",
+                description=cmd.description or "Sin descripción disponible.",
+                color=discord.Color.orange()
+            )
+            # Mostrar argumentos del comando
+            if hasattr(cmd, "parameters") and cmd.parameters:
+                args_text = ""
+                for param in cmd.parameters:
+                    if hasattr(param, "name"):
+                        args_text += f"`{param.name}`: {getattr(param, 'description', 'Sin descripción')}\n"
+                if args_text:
+                    embed.add_field(name="Argumentos", value=args_text, inline=False)
+            await select_interaction.response.edit_message(embed=embed)
+
+        select.callback = select_callback
+
+        # Botones de paginación
+        view = View()
+        view.add_item(select)
+
+        if total_pages > 1:
+            class PrevPage(Button):
+                def __init__(self):
+                    super().__init__(label="⏪ Anterior", style=discord.ButtonStyle.secondary)
+                async def callback(self, i):
+                    nonlocal page
+                    page = (page - 1) % total_pages
+                    select.options = get_options(page)
+                    await i.response.edit_message(view=view)
+
+            class NextPage(Button):
+                def __init__(self):
+                    super().__init__(label="Siguiente ⏩", style=discord.ButtonStyle.secondary)
+                async def callback(self, i):
+                    nonlocal page
+                    page = (page + 1) % total_pages
+                    select.options = get_options(page)
+                    await i.response.edit_message(view=view)
+
+            view.add_item(PrevPage())
+            view.add_item(NextPage())
+
+        await interaction.response.edit_message(embed=discord.Embed(title=f"📖 {self.label}"), view=view)
+
+
+# Comando de barra /help
+@bot.tree.command(name="help", description="Muestra todos los comandos del bot categorizados.")
+async def help_command(interaction: discord.Interaction):
+    commands_list = bot.tree.get_commands()
+    view = HelpView(commands_list)
+
+    try:
+        # Envía el mensaje inicial
+        await interaction.response.send_message(embed=view.embed, view=view, ephemeral=False)
+    except discord.InteractionResponded:
+        # Si ya fue respondido, usa followup
+        await interaction.followup.send(embed=view.embed, view=view)
+
+
+# ====== RUN ======
+if __name__ == "__main__":
+    setup_anime_commands(bot)
+    keep_alive()
+    try:
+        bot.run(TOKEN)
+    finally:
+        # cerrar sesión http si existe al terminar
+        if http_session and not http_session.closed:
+            asyncio.run(http_session.close())

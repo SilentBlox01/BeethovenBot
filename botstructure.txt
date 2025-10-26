@@ -1,0 +1,15 @@
+Beethoven - copia/
+├── bot.py
+├── cogs/
+│   ├── help.py
+│   ├── events.py
+│   ├── moderation.py
+│   ├── utility.py
+│   ├── fun.py
+│   ├── anime.py
+│   ├── afk.py
+│   ├── calculator.py
+│   ├── misc.py
+├── utils/
+│   ├── rate_limiter.py
+├── .env
